@@ -41,26 +41,32 @@ class FirebaseManager {
         };
     }
 
-    async getUserIP() {
-        try {
-            const response = await fetch('https://api.ipify.org?format=json');
-            const data = await response.json();
-            return data.ip;
-        } catch (error) {
-            console.error('Error getting IP:', error);
-            return null;
-        }
-    }
-
-    async saveUser(username, ip) {
+    async saveUser(username, deviceId) {
         const userRef = ref(this.db, `users/${username}`);
         await set(userRef, {
             username,
-            ip,
+            deviceId,
             lastSeen: serverTimestamp(),
             status: true,
-            createdAt: serverTimestamp()
+            createdAt: serverTimestamp(),
+            devices: {
+                [deviceId]: true
+            }
         });
+    }
+
+    async getExistingUserByDevice(deviceId) {
+        const snapshot = await get(this.refs.users);
+        let foundUser = null;
+        
+        snapshot.forEach(childSnapshot => {
+            const userData = childSnapshot.val();
+            if (userData.devices && userData.devices[deviceId]) {
+                foundUser = { username: childSnapshot.key, ...userData };
+            }
+        });
+        
+        return foundUser;
     }
 
     async deleteUser(username) {
@@ -71,6 +77,26 @@ class FirebaseManager {
             console.error('Error deleting user:', error);
             throw error;
         }
+    }
+}
+
+// Add after FirebaseManager class
+class DeviceManager {
+    static generateDeviceId() {
+        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+        const timestamp = new Date().getTime().toString(36);
+        const randomChars = Array.from({ length: 10 }, () => 
+            chars.charAt(Math.floor(Math.random() * chars.length))).join('');
+        return `device_${timestamp}_${randomChars}`;
+    }
+
+    static getDeviceId() {
+        let deviceId = localStorage.getItem('deviceId');
+        if (!deviceId) {
+            deviceId = this.generateDeviceId();
+            localStorage.setItem('deviceId', deviceId);
+        }
+        return deviceId;
     }
 }
 
@@ -187,57 +213,31 @@ async function checkExistingUser(username) {
     return snapshot.exists();
 }
 
-// Add new functions for IP management
-async function findUserByIP(ip) {
-    const snapshot = await get(usersRef);
-    let foundUser = null;
-    snapshot.forEach(childSnapshot => {
-        const userData = childSnapshot.val();
-        if (userData.ip === ip) {
-            foundUser = { username: childSnapshot.key, ...userData };
-        }
-    });
-    return foundUser;
-}
-
-async function deleteUserIP(username) {
-    const userRef = ref(db, `users/${username}`);
-    await update(userRef, {
-        ip: null,
-        status: false,
-        lastSeen: serverTimestamp()
-    });
-}
-
 // Modify the initializeUser function
 async function initializeUser() {
     try {
-        const ip = await firebaseManager.getUserIP();
-        if (ip) {
-            const existingUser = await findUserByIP(ip);
-            if (existingUser) {
-                // Auto login
-                currentUser = existingUser.username;
-                chatUI.elements.loginContainer.style.display = 'none';
-                chatUI.elements.chatContainer.style.display = 'block';
-                chatUI.elements.userDisplay.textContent = `مرحباً ${existingUser.username}`;
-                
-                // Update user status
-                const userRef = ref(db, `users/${existingUser.username}`);
-                await update(userRef, {
-                    status: true,
-                    lastSeen: serverTimestamp()
-                });
-                
-                // Set up disconnect handler
-                onDisconnect(userRef).update({
-                    status: false,
-                    lastSeen: serverTimestamp()
-                });
-                
-                loadMessages();
-                return true;
-            }
+        const deviceId = DeviceManager.getDeviceId();
+        const existingUser = await firebaseManager.getExistingUserByDevice(deviceId);
+        
+        if (existingUser) {
+            currentUser = existingUser.username;
+            chatUI.elements.loginContainer.style.display = 'none';
+            chatUI.elements.chatContainer.style.display = 'block';
+            chatUI.elements.userDisplay.textContent = `مرحباً ${existingUser.username}`;
+            
+            const userRef = ref(db, `users/${existingUser.username}`);
+            await update(userRef, {
+                status: true,
+                lastSeen: serverTimestamp()
+            });
+            
+            onDisconnect(userRef).update({
+                status: false,
+                lastSeen: serverTimestamp()
+            });
+            
+            loadMessages();
+            return true;
         }
         return false;
     } catch (error) {
@@ -274,8 +274,8 @@ chatUI.elements.loginButton.addEventListener('click', async () => {
                 return;
             }
 
-            const ip = await firebaseManager.getUserIP();
-            await firebaseManager.saveUser(username, ip);
+            const deviceId = DeviceManager.getDeviceId();
+            await firebaseManager.saveUser(username, deviceId);
             
             currentUser = username;
             chatUI.elements.loginContainer.style.display = 'none';
@@ -611,15 +611,28 @@ onValue(typingRef, (snapshot) => {
     }
 });
 
-// Add logout handler
+// Update logout handler
 chatUI.elements.logoutButton.addEventListener('click', async () => {
     try {
-        await firebaseManager.deleteUser(currentUser);
-        currentUser = '';
-        chatUI.elements.chatContainer.style.display = 'none';
-        chatUI.elements.loginContainer.style.display = 'block';
-        chatUI.elements.messages.innerHTML = '';
-        chatUI.elements.userNameInput.value = '';
+        if (currentUser) {
+            // Delete user from all locations in the database
+            await remove(ref(db, `users/${currentUser}`));
+            await remove(ref(db, `typing/${currentUser}`));
+            
+            // Clear local data
+            localStorage.removeItem('deviceId'); // Remove device ID to prevent auto-login
+            currentUser = '';
+            
+            // Update UI
+            chatUI.elements.chatContainer.style.display = 'none';
+            chatUI.elements.loginContainer.style.display = 'block';
+            chatUI.elements.messages.innerHTML = '';
+            chatUI.elements.userNameInput.value = '';
+            
+            // Cancel any pending disconnect operations
+            const userRef = ref(db, `users/${currentUser}`);
+            await onDisconnect(userRef).cancel();
+        }
     } catch (error) {
         console.error('Error logging out:', error);
         alert('حدث خطأ أثناء تسجيل الخروج. الرجاء المحاولة مرة أخرى.');
